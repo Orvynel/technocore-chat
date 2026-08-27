@@ -21,20 +21,31 @@ holds because of a coincidence of two default arguments:
     _last_nonce      for raw in reverse_lines(f):        <- default max_bytes
 
 Those are the *only* two call sites in the module that take `reverse_lines`' default budget.
-(store.py:751 and store.py:1759 at the time of writing, but the line numbers are not what this
-rests on: `test_the_guard_and_the_tail_read_take_the_same_default_budget` below counts the bare
-call sites in the source and fails at three, so this paragraph cannot rot into a lie.)
 Every other one names its own and narrower (`last_seq` 64 KiB, the tripwire window 64 KiB) or is
-a write path (`_compact`, MAX_ROOM_BYTES). So the depth a reader can see and the depth a nonce
-is guarded to are the same 1 MiB — and *therefore* a replay is accepted only once the record it
-would duplicate has already dropped out of every tail response. The two windows cannot diverge
-because they are one constant, and nothing anywhere records that this is load-bearing.
+a write path (`_compact`, MAX_ROOM_BYTES).
 
-Widen one and not the other and the property is gone. `test_narrowing_only_the_guards_budget…`
-below constructs that state on purpose: a record a reader can still see, whose nonce is no longer
-guarded, so the replay lands as a second visible record with the same signature, nonce and text
-as the first. That is what a "let readers page further back" change costs if it touches
-`read_messages`' budget alone, and it is the state these tests exist to keep unreachable.
+The property that follows, stated carefully, is an ORDERING and not an equality:
+
+    guard depth  >=  visible depth
+
+Today the two are the same 1 MiB, which satisfies it with no slack. But equality is not what
+safety needs, and asserting equality would be asserting the mechanism: the guard is *allowed* to
+reach further back than a reader can see, and in two places it already does — an expired `e-`
+record still guards its nonce, and a MAX_LIMIT tail can run out of records before it runs out of
+budget. Stricter-than-visible costs nothing and hides nothing. Only the reverse is a hole.
+
+So the thing to hold onto is the direction, not the coincidence. `a_visible_record_is_always_
+still_guarded` asserts it over the whole state machine, and
+`test_the_guard_scans_at_least_as_deep_as_a_reader_can_see` measures both depths directly by
+giving every record its own key. Neither one counts bytes or restates the scan.
+
+Widen the reader's budget and not the guard's and the ordering is gone.
+`test_narrowing_only_the_guards_budget…` below constructs that state on purpose: a record a
+reader can still see, whose nonce is no longer guarded, so the replay lands as a second visible
+record with the same signature, nonce and text as the first. That is what a "let readers page
+further back" change costs if it touches `read_messages`' budget alone, and it is the state
+these tests exist to keep unreachable. Nothing in the repo records that this is load-bearing,
+which is the gap this file closes.
 
 The retention ring is a red herring here, and worth naming because it looks relevant: records
 survive on disk for 5-10 MiB (COMPACT_KEEP_BYTES, MAX_ROOM_BYTES), far past the 1 MiB either
@@ -469,15 +480,64 @@ def test_read_budget_is_bound_into_reverse_lines_not_read_from_the_module() -> N
         setattr(store, "READ_BUDGET", original)  # noqa: B010
 
 
-def test_the_guard_and_the_tail_read_take_the_same_default_budget() -> None:
-    """The coupling the security property rests on, asserted at the source.
+def test_the_guard_scans_at_least_as_deep_as_a_reader_can_see(tmp_path) -> None:
+    """The security property as an ORDERING, measured rather than read off the source.
 
-    `read_messages` and `_last_nonce` are the only two `reverse_lines` call sites in the module
-    that pass no `max_bytes`, so they scan equally deep and a nonce is guarded exactly as far
-    back as a reader can see. Every other site names a narrower budget, or is a write path.
+    `guard depth >= visible depth`. That is the whole requirement, and it is deliberately not
+    equality: the guard is allowed to outlive visibility — an expired `e-` record still guards,
+    and a MAX_LIMIT tail may not reach as far back as the budget does — because
+    stricter-than-visible is the safe direction. Only the other direction is a hole.
 
-    Read as a tripwire, not a style rule: this fails on the change that gives either one its own
-    budget, which is the change that opens the state the next test constructs.
+    Measured by giving every record its own key, which makes the two depths separately
+    observable: a key is *visible* if `read_messages` returns its record, and *guarded* if
+    `_last_nonce` still answers for it. The property is then plain set containment, with no
+    byte counting and no restatement of the algorithm.
+
+    This replaces an earlier version that counted `reverse_lines(f)` call sites in `store.py`
+    and asserted there were exactly two. That asserted sameness at the call site, which is a
+    mechanism and the wrong shape: it went red on a harmless reformat, and it stayed green for
+    a new read path that named a *wider* budget explicitly — the one change that actually
+    breaks the ordering. `test_only_two_read_paths_take_the_default_budget` keeps the useful
+    half of that grep as a locator, below.
+    """
+    room = "lobby"
+    keys = [_did(n) for n in range(3, 19)]  # 16 keys, one record each
+    assert len(set(keys)) == len(keys)
+
+    with _window(WINDOW_BYTES):
+        for key in keys:
+            store.append(tmp_path, room, "", "one record", did=key, nonce=1)
+
+        visible = {r["from"] for r in _visible(tmp_path, room) if r.get("from") in keys}
+        guarded = {k for k in keys if store._last_nonce(tmp_path, room, k) is not None}
+
+        # Both directions have to be non-trivial or the containment below proves nothing: if
+        # everything is guarded the assertion is vacuous, and if nothing is visible there is no
+        # depth to compare against.
+        assert visible, "no record was readable — the window is too small to compare depths"
+        assert len(guarded) < len(keys), (
+            f"all {len(keys)} keys are still guarded, so the boundary was never crossed and "
+            f"this test is vacuous — lower WINDOW_BYTES or write more records"
+        )
+
+        assert visible <= guarded, (
+            f"{sorted(didkey.abbreviate(d) for d in visible - guarded)} have READABLE records "
+            f"whose nonce is no longer guarded: the reader now scans deeper than the replay "
+            f"guard, so those messages' signed URLs can be replayed while still on the page"
+        )
+
+
+def test_only_two_read_paths_take_the_default_budget() -> None:
+    """A locator, not the property — the property is the ordering asserted above.
+
+    `read_messages` and `_last_nonce` are the only `reverse_lines` call sites in the module that
+    pass no `max_bytes`. That is worth knowing when this file goes red, because it says where to
+    look; it is not itself the guarantee, and a green result here does not mean the ordering
+    holds.
+
+    Kept deliberately narrow: if a third unbudgeted read path appears, it inherits the guard's
+    reach by accident rather than by decision, and someone should say which it meant. Adjust the
+    count and move on — this is a prompt, not a veto.
     """
     source = Path(store.__file__).read_text(encoding="utf-8")
     bare = [
@@ -487,8 +547,9 @@ def test_the_guard_and_the_tail_read_take_the_same_default_budget() -> None:
     ]
     assert len(bare) == 2, (
         f"expected exactly two default-budget reverse_lines calls (read_messages and "
-        f"_last_nonce); found {len(bare)} at lines {bare}. If a new read path was added, it "
-        "must scan no deeper than the replay guard, or a readable record stops being guarded."
+        f"_last_nonce); found {len(bare)} at lines {bare}. A new unbudgeted read path is not "
+        f"necessarily wrong — but check it against "
+        f"test_the_guard_scans_at_least_as_deep_as_a_reader_can_see before changing this number."
     )
 
 
