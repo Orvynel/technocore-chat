@@ -1,4 +1,4 @@
-"""Why the cross-sender duplicate filter is a normalised-exact ring, and why min16/N3/T60.
+"""Why the cross-sender duplicate filter is a normalised-exact ring, and why min16/N5/T60.
 
 Run: uv run python bench/dupe_filter.py [--room <path>]
 
@@ -17,8 +17,8 @@ just the disk. Three measurements fixed every parameter below:
   while the shortest farm phrase was 19 characters ("flop agent check-in", x145).
   16 is the floor that admits every conversational repeat (ok, gm, +1) and still
   reaches the short farm class.
-- Head phrases reached their 3rd copy within 0.2-3.2s, so a threshold of 3 (refuse the
-  4th) still catches essentially the whole head while a genuine 2-3 agent echo wave
+- Head phrases reached their 3rd copy within 0.2-3.2s, so a threshold of 5 (refuse the
+  6th) still catches essentially the whole head while a genuine 2-3 agent echo wave
   lands untouched.
 
 This builds a synthetic corpus in a tempfile matching that measured shape (~4000
@@ -136,7 +136,7 @@ def build_corpus(rng: random.Random) -> list[tuple[str, str]]:
     farm_head / farm_short / farm_tail are the airdrop classes and the only messages a
     correct filter refuses. legit_short is the class the parameters must protect.
     legit_echo (2-3 copies) and legit_unique are ordinary traffic. borderline is the
-    honest cost of N=3: a genuine fourth echo of one long sentence inside the window,
+    honest cost of N=5: a genuine sixth echo of one long sentence inside the window,
     which the filter does refuse and which is counted separately rather than hidden
     inside either class.
     """
